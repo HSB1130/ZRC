@@ -63,6 +63,11 @@ class ZeroResourceCurriculum:
         self._new_distribution: Optional[np.ndarray] = None
         self._cluster_order: List[int] = []
         self._initial_difficulty: Dict[str, float] = {}
+        self._stabilization_scale: float = 1.0
+        self._kl_decay_rate: float = 1.0
+        self._stabilization_step: int = 0
+        self._current_kl_multiplier: float = 1.0
+        self._base_trl_beta: float = float(self.config.rl.trl.beta)
 
     def register_tasks(
         self,
@@ -112,6 +117,7 @@ class ZeroResourceCurriculum:
         self.state.step = 0
         self._new_distribution = self._compute_uniform_distribution()
         self._old_distribution = None
+        self._sync_kl_penalty()
 
     def _task_embeddings(
         self, task_ids: Sequence[str]
@@ -191,21 +197,32 @@ class ZeroResourceCurriculum:
 
             cp_prob = self.bocpd.update(cluster_id, successes_cluster, trials)
             if cp_prob > self.config.changepoint.threshold:
-                self._trigger_recluster()
+                mode = self._decide_recluster_mode(cp_prob)
+                self._trigger_recluster(mode=mode)
                 break
 
-        if self.state.stabilization_remaining > 0:
-            self.state.stabilization_remaining -= 1
-
-    def _trigger_recluster(self) -> None:
+    def _trigger_recluster(self, mode: str) -> None:
         self._old_distribution = self._compute_distribution()
         embeddings, ids = self._task_embeddings(self.state.assignments.keys())
-        assignment = self.dpmeans.fit(ids, embeddings)
-        self.state.assignments = assignment.assignments
-        self.state.centroids = assignment.centroids
+        assignments: Dict[str, int]
+        centroids: np.ndarray
+        if (
+            mode == "soft"
+            and self.dpmeans.centroids.size > 0
+            and self.config.changepoint.soft_threshold >= self.config.changepoint.threshold
+        ):
+            assignments = self.dpmeans.soft_reassign(ids, embeddings)
+            centroids = self.dpmeans.centroids
+        else:
+            assignment = self.dpmeans.fit(ids, embeddings)
+            assignments = assignment.assignments
+            centroids = assignment.centroids
+
+        self.state.assignments = assignments
+        self.state.centroids = centroids
         self.state.cluster_stats = {
             cluster_id: ClusterStats()
-            for cluster_id in set(assignment.assignments.values())
+            for cluster_id in set(self.state.assignments.values())
         }
 
         for cluster_id in self.state.cluster_stats:
@@ -214,7 +231,7 @@ class ZeroResourceCurriculum:
 
         self._cluster_order = sorted(self.state.cluster_stats.keys())
         self._new_distribution = self._compute_uniform_distribution()
-        self.state.stabilization_remaining = self.config.stabilization.window
+        self._start_stabilization_window()
 
     def _compute_distribution(self) -> np.ndarray:
         ordered_items = sorted(self.state.cluster_stats.items())
@@ -241,3 +258,72 @@ class ZeroResourceCurriculum:
             stabilization_remaining=self.state.stabilization_remaining,
             step=self.state.step,
         )
+
+    def kl_penalty_multiplier(self) -> float:
+        """Return the multiplicative factor for the KL penalty during stabilization."""
+        self._sync_kl_penalty()
+        return self._current_kl_multiplier
+
+    @property
+    def base_kl_penalty(self) -> float:
+        return self._base_trl_beta
+
+    def current_kl_penalty(self) -> float:
+        return self.base_kl_penalty * self._current_kl_multiplier
+
+    def _decide_recluster_mode(self, cp_prob: float) -> str:
+        hard_threshold = max(
+            self.config.changepoint.threshold,
+            self.config.changepoint.hard_threshold,
+        )
+        soft_threshold = max(
+            self.config.changepoint.threshold,
+            min(self.config.changepoint.soft_threshold, hard_threshold),
+        )
+        if cp_prob >= hard_threshold:
+            return "hard"
+        if cp_prob >= soft_threshold and self.dpmeans.centroids.size > 0:
+            return "soft"
+        return "hard"
+
+    def _start_stabilization_window(self) -> None:
+        window = max(0, int(self.config.stabilization.window))
+        scale = float(max(1.0, self.config.stabilization.kl_scale))
+        if window > 0 and scale > 1.0:
+            self.state.stabilization_remaining = window
+            self._stabilization_scale = scale
+            self._kl_decay_rate = scale ** (-1.0 / float(window))
+            self._stabilization_step = 0
+        else:
+            self.state.stabilization_remaining = 0
+            self._stabilization_scale = 1.0
+            self._kl_decay_rate = 1.0
+            self._stabilization_step = 0
+        self._sync_kl_penalty()
+
+    def advance_stabilization(self) -> None:
+        """Advance the stabilization schedule after an RL update."""
+        if self.state.stabilization_remaining <= 0:
+            return
+        self.state.stabilization_remaining = max(0, self.state.stabilization_remaining - 1)
+        self._stabilization_step = min(
+            self._stabilization_step + 1,
+            max(0, int(self.config.stabilization.window)),
+        )
+        if self.state.stabilization_remaining == 0:
+            self._stabilization_scale = 1.0
+            self._kl_decay_rate = 1.0
+            self._stabilization_step = 0
+        self._sync_kl_penalty()
+
+    def _sync_kl_penalty(self) -> None:
+        multiplier = 1.0
+        window = max(0, int(self.config.stabilization.window))
+        if (
+            window > 0
+            and self.state.stabilization_remaining > 0
+            and self._stabilization_scale > 1.0
+        ):
+            multiplier = self._stabilization_scale * (self._kl_decay_rate ** self._stabilization_step)
+        self._current_kl_multiplier = float(multiplier)
+        self.config.rl.trl.beta = self.current_kl_penalty()

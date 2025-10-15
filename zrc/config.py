@@ -30,6 +30,8 @@ class BOCPDConfig:
 
     hazard: float = 0.01
     threshold: float = 0.6
+    soft_threshold: float = 0.75
+    hard_threshold: float = 0.9
     min_steps_between_recluster: int = 100
 
 

@@ -266,6 +266,32 @@ def main() -> None:
 
     task_lookup: Dict[str, TaskRecord] = {record.task_id: record for record in records}
     dataset = CurriculumIterableDataset(curriculum, task_lookup)
+    trainer_holder: Dict[str, Optional[GRPOTrainer]] = {"trainer": None}
+    step_counter = {"calls": 0}
+
+    def _apply_curriculum_kl_penalty(trainer: Optional[GRPOTrainer]) -> None:
+        if trainer is None:
+            return
+        beta_value = curriculum.current_kl_penalty()
+        if hasattr(trainer, "args"):
+            trainer.args.beta = beta_value
+        if hasattr(trainer, "beta"):
+            trainer.beta = beta_value  # type: ignore[attr-defined]
+        scheduler = getattr(trainer, "beta_scheduler", None)
+        if scheduler is not None:
+            if hasattr(scheduler, "value"):
+                scheduler.value = beta_value
+            if hasattr(scheduler, "set_value"):
+                try:
+                    scheduler.set_value(beta_value)  # type: ignore[call-arg]
+                except TypeError:
+                    pass
+        controller = getattr(trainer, "kl_controller", None)
+        if controller is not None:
+            if hasattr(controller, "value"):
+                controller.value = beta_value
+            if hasattr(controller, "target_kl"):
+                controller.target_kl = beta_value
 
     def reward_function(
         *,
@@ -278,6 +304,10 @@ def main() -> None:
         **kwargs,
     ) -> List[float]:
         del completion_ids, trainer_state, kwargs
+        trainer = trainer_holder.get("trainer")
+        if step_counter["calls"] > 0:
+            curriculum.advance_stabilization()
+        _apply_curriculum_kl_penalty(trainer)
         # Expand metadata if vLLM generated multiple completions per prompt.
         task_ids = list(task_id)
         answers = list(answer)
@@ -294,6 +324,8 @@ def main() -> None:
         verification_failures = [not flag for flag in successes]
         if task_ids:
             curriculum.record_outcomes(task_ids, successes, verification_failures)
+            _apply_curriculum_kl_penalty(trainer)
+        step_counter["calls"] += 1
         return rewards
 
     grpo_args = GRPOConfig(
@@ -326,6 +358,8 @@ def main() -> None:
         train_dataset=dataset,
         processing_class=tokenizer,
     )
+    trainer_holder["trainer"] = trainer
+    _apply_curriculum_kl_penalty(trainer)
 
     trainer.train()
 
