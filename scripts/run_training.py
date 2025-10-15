@@ -39,6 +39,66 @@ print("사용 가능한 GPU 개수:", torch.cuda.device_count())
 for i in range(torch.cuda.device_count()):
     print(f"GPU {i}:", torch.cuda.get_device_name(i))
 
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Please reason step by step, and put your final numeric "
+    "answer within \\boxed{...}. Do not include any extra text after the boxed answer."
+)
+
+STOP_SEQUENCES = ["</s>", "\\end{", "\n\n\n"]
+
+
+def format_chat_prompt(question: str, system_prompt: str = SYSTEM_PROMPT) -> str:
+    """Match the chat template used during initial difficulty measurements."""
+    return (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{question}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def parse_model_output(model_output_str: str) -> Optional[float]:
+    """Extract numeric value from model output, prioritizing \\boxed{...} content."""
+    m = re.search(r"\\boxed\{([^{}]+)\}", model_output_str)
+    cand = m.group(1).strip() if m else None
+
+    if cand is None:
+        nums = re.findall(r"-?\d+(?:\.\d+)?", model_output_str)
+        cand = nums[-1] if nums else None
+
+    if cand is None:
+        return None
+
+    try:
+        cand = cand.replace(",", "")
+        if "/" in cand and cand.count("/") == 1:
+            parts = cand.split("/")
+            return float(parts[0].strip()) / float(parts[1].strip())
+        return float(cand)
+    except ValueError:
+        return None
+
+
+def parse_ground_truth_from_deepscaler(answer_str: str, solution_str: str) -> Optional[float]:
+    """Mirror initial difficulty parsing for DeepScaleR answers."""
+    s = answer_str.strip()
+    m = re.fullmatch(r"\s*[-+]?\d+(?:/\d+|\.\d+)?\s*", s)
+    if m:
+        try:
+            if "/" in s:
+                parts = s.split("/")
+                return float(parts[0]) / float(parts[1])
+            return float(s)
+        except Exception:
+            pass
+
+    v = parse_model_output(solution_str)
+    if v is not None:
+        return v
+
+    nums = re.findall(r"-?\d+(?:\.\d+)?", answer_str)
+    return float(nums[-1]) if nums else None
+
+
 @dataclass
 class PrecomputedDifficulty:
     difficulty: float
@@ -77,11 +137,7 @@ class CurriculumIterableDataset(IterableDataset):
 
 
 def build_prompt(problem: str) -> str:
-    return (
-        "You are an expert competition mathematician. Solve the following problem and "
-        "reply with only the final answer in simplest form (no explanation).\n\n"
-        f"Problem:\n{problem}\n\nAnswer:"
-    )
+    return format_chat_prompt(problem)
 
 
 def sanitize_answer(text: str) -> str:
@@ -111,10 +167,19 @@ def canonicalize_answer(text: str) -> str:
     return re.sub(r"[()]", "", text)
 
 
-def evaluate_response(response: str, expected: str) -> Tuple[bool, float]:
-    normalized_prediction = canonicalize_answer(response)
-    normalized_expected = canonicalize_answer(expected)
-    success = normalized_prediction == normalized_expected and normalized_expected != ""
+def evaluate_response(response: str, expected: str, eps: float = 1e-6) -> Tuple[bool, float]:
+    pred_value = parse_model_output(response)
+    expected_value = parse_model_output(expected)
+    success = False
+
+    if pred_value is not None and expected_value is not None:
+        success = abs(pred_value - expected_value) < eps
+    else:
+        normalized_prediction = canonicalize_answer(response)
+        normalized_expected = canonicalize_answer(expected)
+        if normalized_expected:
+            success = normalized_prediction == normalized_expected
+
     reward = 1.0 if success else -1.0
     return success, reward
 
@@ -138,7 +203,14 @@ def deterministic_embeddings(
         input_ids = encoded["input_ids"].to(embed_layer.weight.device)
         with torch.no_grad():
             token_vecs = embed_layer(input_ids)
-            pooled = token_vecs.mean(dim=1).squeeze(0).detach().cpu().numpy()
+            pooled = (
+                token_vecs.mean(dim=1)
+                .squeeze(0)
+                .detach()
+                .to(dtype=torch.float32)
+                .cpu()
+                .numpy()
+            )
         if pooled.shape[0] != embedding_dim:
             raise ValueError("Embedding dimension mismatch.")
         embeddings.append(pooled.astype(np.float32))
@@ -181,8 +253,13 @@ def load_task_records(
         key = normalize_problem(problem)
         stats = precomputed.get(key)
         prompt = build_prompt(problem)
-        answer = stats.ground_truth if stats and stats.ground_truth else row.get("answer", "")
         difficulty = stats.difficulty if stats else None
+        if stats and stats.ground_truth:
+            answer = stats.ground_truth
+        else:
+            raw_answer = row.get("answer", "")
+            parsed = parse_ground_truth_from_deepscaler(raw_answer or "", row.get("solution", ""))
+            answer = str(parsed) if parsed is not None else (raw_answer or "")
         records.append(
             TaskRecord(
                 task_id=f"dsr_{idx:05d}",
@@ -253,9 +330,11 @@ def main() -> None:
     )
     config.rl.trl.policy_model_name = config.transformers.model_name
     config.rl.trl.tokenizer_name = config.transformers.tokenizer_name
+    config.rl.trl.generation_kwargs.setdefault("temperature", 0.7)
+    config.rl.trl.generation_kwargs.setdefault("top_p", 0.95)
+    config.rl.trl.generation_kwargs.setdefault("stop", STOP_SEQUENCES)
 
     policy_model, tokenizer = load_causal_lm(config.transformers)
-
     records = load_task_records(args.split, args.limit, precomputed_map)
     if not records:
         raise RuntimeError("No tasks loaded from dataset.")
@@ -366,6 +445,7 @@ def main() -> None:
         logging_steps=1,
         save_strategy="no",
         report_to=[],
+        accelerator_config={"dispatch_batches": False},
     )
 
     trainer = GRPOTrainer(

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..config import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def load_causal_lm(config: TransformerConfig) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
@@ -28,7 +31,15 @@ def load_causal_lm(config: TransformerConfig) -> Tuple[AutoModelForCausalLM, Aut
         torch_dtype=dtype,
         trust_remote_code=config.trust_remote_code,
     )
-    model.resize_token_embeddings(len(tokenizer))
+    original_vocab = model.get_input_embeddings().weight.shape[0]
+    tokenizer_vocab = len(tokenizer)
+    if tokenizer_vocab > original_vocab:
+        model.resize_token_embeddings(tokenizer_vocab)
+    elif tokenizer_vocab < original_vocab:
+        logger.warning(
+            "Tokenizer vocab size (%s) smaller than model (%s); skipping resize to keep original weights.",
+            tokenizer_vocab,
+            original_vocab,
+        )
     model.eval()
     return model, tokenizer
-
