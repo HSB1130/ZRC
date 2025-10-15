@@ -7,8 +7,11 @@ import argparse
 import json
 import random
 import re
+import os
+from setproctitle import setproctitle, getproctitle
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -17,10 +20,24 @@ from datasets import load_dataset
 from torch.utils.data import IterableDataset
 from trl import GRPOConfig, GRPOTrainer
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from zrc import ZRCConfig, ZeroResourceCurriculum
 from zrc.config import TransformerConfig
 from zrc.models import load_causal_lm
 
+# Process 이름 설정
+setproctitle("sungbinhan9039")
+print("변경된 프로세스 이름:", getproctitle())
+
+# GPU 0번과 1번만 보이도록 제한
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+print("사용 가능한 GPU 개수:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(f"GPU {i}:", torch.cuda.get_device_name(i))
 
 @dataclass
 class PrecomputedDifficulty:
